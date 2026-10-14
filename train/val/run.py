@@ -1,5 +1,9 @@
 """Track 1: Dust with ANVIL II on the block matrices and Adam elsewhere, without backpropagation.
 
+Ablation of PR #5's orthogonal draws alone, on the PR #4 record: a token's draws over the step are rows of a
+sign-flipped Hadamard matrix, orthogonal across chunks and GPUs, so K draws recover K directions of the credit
+exactly. Everything else (slab head, every draw count, rates, schedule) is the PR #4 record's.
+
 Launch: torchrun --standalone --nproc_per_node=8 train/val/run.py
 """
 import argparse
@@ -102,6 +106,21 @@ def block_forward(x, w, ve, cos, sin, window, o=None, attn=None, fc=None, mlp=No
     return x + add(F.linear(F.relu(hidden).square(), w['out']), mlp)
 
 
+HADAMARDS = {}
+
+
+def hadamard(d, device, dtype):
+    """The Sylvester Hadamard matrix of order d (a power of two), entries +-1, built once per process."""
+    if (d, device, dtype) not in HADAMARDS:
+        if d & (d - 1):
+            raise ValueError(f'Orthogonal draws need a power-of-two width, not {d}.')
+        H = torch.ones(1, 1, device=device)
+        while H.shape[0] < d:
+            H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+        HADAMARDS[d, device, dtype] = H.to(dtype)  # +-1 is exact in bfloat16
+    return HADAMARDS[d, device, dtype]
+
+
 def average_ranks(tensor):
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
@@ -113,10 +132,12 @@ class DUST:
     """Forward-only gradient estimator: caches activations, then reruns from the jittered block."""
 
     def __init__(self, model, recipe, seed=0, rank=0, world=1):
-        self.model, self.recipe, self.world = model, recipe, world
+        self.model, self.recipe, self.world, self.rank = model, recipe, world, rank
         self.device = next(model.parameters()).device
         self.dtype = torch.bfloat16 if self.device.type == 'cuda' else torch.float32
         self.generator = torch.Generator(self.device).manual_seed(seed + 3 + 7777 * rank)
+        self.shared_generator = torch.Generator(self.device).manual_seed(seed + 5)  # the same on every GPU
+        self.frames = {}
         self.modules = {n: m for n, m in model.named_modules() if isinstance(m, (nn.Linear, nn.Embedding))}
         self.inputs, self.outputs, self.blocks = {}, {}, {}
         self.weights = [dict(q=b.attn.c_q.weight, k=b.attn.c_k.weight, v=b.attn.c_v.weight,
@@ -162,6 +183,28 @@ class DUST:
     def noise(self, *shape, dtype=None):
         return torch.randn(*shape, device=self.device, dtype=dtype or self.dtype, generator=self.generator)
 
+    def signs(self, *shape, shared=False):
+        """Random +-1 in the draw dtype, from the GPU's own generator or the one shared by all GPUs."""
+        generator = self.shared_generator if shared else self.generator
+        return torch.randint(0, 2, shape, device=self.device, generator=generator).to(self.dtype) * 2 - 1
+
+    def orthogonal_noise(self, site, draws, chunk, n, b, t, d, dtype=None):
+        """Draws start..start + n of this step's world * draws at `site`. Draw i at a token is row (offset + i)
+        mod d of the Hadamard matrix under the sign pattern of cycle i // d: the patterns (one per cycle of d
+        draws, drawn up front in the same order on every GPU) and the tokens' row offsets are shared by the
+        GPUs, so a token's draws are orthogonal across chunks and GPUs within each cycle, and the independent
+        offsets leave the tokens' errors uncorrelated. Each draw's own sign flip keeps distinct draws
+        uncorrelated, so the chunk centering shrinks the estimate uniformly, as with Gaussian draws. E[a a^T] = I."""
+        if site not in self.frames:  # this step's frame at the site
+            cycles = -(-self.world * draws // d)
+            self.frames[site] = (self.signs(cycles, d, shared=True),
+                                 torch.randint(0, d, (b, t), device=self.device, generator=self.shared_generator))
+        patterns, offset = self.frames[site]
+        index = self.rank * draws + chunk * n + torch.arange(n, device=self.device)
+        rows = (offset.unsqueeze(0) + index[:, None, None]) % d  # (n, b, t)
+        a = hadamard(d, self.device, self.dtype)[rows] * patterns[index // d][:, None, None, :] * self.signs(n, b, t, 1)
+        return a if dtype in (None, self.dtype) else a.to(dtype)
+
     def losses(self, x, y):
         with self.autocast():
             return self.model(x, y, loss_reduction='none').view_as(y).float()
@@ -169,6 +212,7 @@ class DUST:
     def capture(self, x, y):
         self.x, self.y = x, y
         self.batch, self.length = x.shape
+        self.frames.clear()  # this step's draw frames
         self.capturing = True
         try:
             self.clean_loss = self.losses(x, y)
@@ -208,8 +252,9 @@ class DUST:
         width = lambda s: self.model.config.n_embd if s.startswith('o@') else self.outputs[s].shape[-1]
         errors = {s: torch.zeros(self.batch, self.length, width(s), device=self.device) for s in sites}
 
-        for _ in range(draws // n):
-            noise = {s: self.noise(n * self.batch, self.length, width(s)) for s in sites}
+        for chunk in range(draws // n):
+            noise = {s: self.orthogonal_noise(s, draws, chunk, n, self.batch, self.length, width(s)).flatten(0, 1)
+                     for s in sites}
             perturbed_loss = self.rerun(n, entry, {s: sigma * a for s, a in noise.items()})
 
             reward = self.clean_loss.unsqueeze(0) - perturbed_loss
@@ -300,9 +345,9 @@ class DUST:
             credit = ((lag >= 0) & (lag <= window)).float() * self.recipe.gamma ** lag.clamp(min=0)
             clean[i] = q, k, z, ve, qp, kp, values, baseline, credit
 
-        for _ in range(draws // n):
+        for chunk in range(draws // n):
             for i in layers:
-                a = self.noise(n, b, t, width, dtype=torch.float32)
+                a = self.orthogonal_noise(sites[i], draws, chunk, n, b, t, width, dtype=torch.float32)
                 q, k, z, ve, qp, kp, values, baseline, credit = clean[i]
                 window = self.model.window_sizes[i][0]
                 divisor = sigma
